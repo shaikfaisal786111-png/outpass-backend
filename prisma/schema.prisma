@@ -1,0 +1,88 @@
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  HOD
+  GUARD
+  MENTOR
+  STUDENT
+}
+
+enum OutpassStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXITED
+  EXPIRED
+  CANCELLED
+}
+
+model User {
+  id           String     @id @default(uuid())
+  email        String     @unique
+  passwordHash String
+  role         Role
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  decisions    Outpass[]  @relation("OutpassDecidedBy")
+  mentorVerifications Outpass[] @relation("OutpassMentor")
+  auditLogs    AuditLog[]
+}
+
+model Student {
+  id        String    @id @default(uuid())
+  rollNo    String    @unique
+  name      String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  outpasses Outpass[]
+}
+
+model Outpass {
+  id           String        @id @default(uuid())
+  studentId    String
+  student      Student       @relation(fields: [studentId], references: [id])
+  destination  String
+  reason       String
+  leaveAt      DateTime
+  returnAt     DateTime
+  status       OutpassStatus @default(PENDING)
+  requestedAt  DateTime      @default(now())
+  approvedAt   DateTime?
+  approvedById String?
+  approvedBy   User?         @relation("OutpassDecidedBy", fields: [approvedById], references: [id])
+  mentorVerified Boolean      @default(false)
+  mentorId     String?
+  mentor       User?         @relation("OutpassMentor", fields: [mentorId], references: [id])
+  rejectedAt   DateTime?
+  rejectNote   String?
+  exitedAt     DateTime?
+  expiresAt    DateTime?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  auditLogs    AuditLog[]
+
+  @@index([studentId, requestedAt])
+  @@index([status, requestedAt])
+  @@index([mentorVerified, status, requestedAt])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  action    String
+  metadata  Json?
+  outpassId String?
+  outpass   Outpass? @relation(fields: [outpassId], references: [id])
+  actorId   String?
+  actor     User?    @relation(fields: [actorId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@index([outpassId, createdAt])
+}

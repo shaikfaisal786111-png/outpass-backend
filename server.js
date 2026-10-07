@@ -1,0 +1,161 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { z } = require('zod');
+const { PrismaClient, OutpassStatus, Role } = require('@prisma/client');
+
+const app = express();
+app.set('trust proxy', 1);
+const prisma = new PrismaClient();
+const PORT = Number(process.env.PORT || 5000);
+const secret = process.env.JWT_SECRET;
+const origins = new Set([
+  'https://outpass-frontend-psi.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:3000',
+  ...(process.env.CORS_ORIGIN || '').split(',').map((value) => value.trim()).filter(Boolean),
+]);
+if (!secret) throw new Error('JWT_SECRET must be set.');
+
+app.disable('x-powered-by');
+app.use(helmet());
+const corsOptions = {
+  origin(origin, callback) {
+    // Requests without an Origin header (Render health checks, curl, native apps)
+    // are not browser CORS requests and can safely reach the API.
+    if (!origin || origins.has(origin)) return callback(null, true);
+    return callback(new Error('Origin is not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  optionsSuccessStatus: 204,
+};
+app.use(cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
+app.use(express.json({ limit: '20kb' }));
+const limiter = (limit, message = 'Too many requests. Please wait a few minutes.') => rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  handler: (_req, res) => res.status(429).json({ success: false, message }),
+});
+app.use(limiter(250));
+
+// Students should only provide the reason and destination.  The issue/expiry window is
+// managed by the system so a pass can always be scanned immediately after approval.
+const requestSchema = z.object({ name: z.string().trim().min(2).max(100), rollNo: z.string().trim().min(2).max(40), destination: z.string().trim().min(2).max(160), reason: z.string().trim().min(5).max(600) });
+const loginSchema = z.object({ email: z.string().trim().email(), password: z.string().min(8).max(128) });
+const rejectSchema = z.object({ note: z.string().trim().min(3).max(300) });
+const roll = (value) => value.trim().toUpperCase();
+const parse = (schema, value, res) => { const result = schema.safeParse(value); if (!result.success) { res.status(400).json({ success: false, message: result.error.issues[0].message }); return null; } return result.data; };
+const range = (month) => {
+  const current = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit' }).format(new Date());
+  const selected = /^\d{4}-(0[1-9]|1[0-2])$/.test(month || '') ? month : current;
+  const [year, number] = selected.split('-').map(Number);
+  const next = number === 12 ? `${year + 1}-01` : `${year}-${String(number + 1).padStart(2, '0')}`;
+  return { selected, start: new Date(`${selected}-01T00:00:00+05:30`), end: new Date(`${next}-01T00:00:00+05:30`) };
+};
+const audit = (action, data = {}) => prisma.auditLog.create({ data: { action, ...data } });
+const session = (user) => jwt.sign({ sub: user.id, email: user.email, role: user.role, type: 'session' }, secret, { expiresIn: '8h' });
+const allowed = (...roles) => (req, res, next) => {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+  if (!token) return res.status(401).json({ success: false, message: 'Sign in is required.' });
+  try { const user = jwt.verify(token, secret); if (user.type !== 'session' || !roles.includes(user.role)) return res.status(403).json({ success: false, message: 'Permission denied.' }); req.user = user; return next(); }
+  catch { return res.status(401).json({ success: false, message: 'Your session has expired. Please sign in again.' }); }
+};
+
+async function bootstrapUsers() {
+  for (const account of [{ email: process.env.HOD_EMAIL, password: process.env.HOD_PASSWORD, role: Role.HOD }, { email: process.env.GUARD_EMAIL, password: process.env.GUARD_PASSWORD, role: Role.GUARD }, { email: process.env.MENTOR_EMAIL, password: process.env.MENTOR_PASSWORD, role: Role.MENTOR }]) {
+    if (!account.email || !account.password) continue;
+    const passwordHash = await bcrypt.hash(account.password, 12);
+    await prisma.user.upsert({ where: { email: account.email.toLowerCase() }, update: { passwordHash, role: account.role }, create: { email: account.email.toLowerCase(), passwordHash, role: account.role } });
+  }
+}
+
+app.get('/health', async (_req, res, next) => { try { await prisma.$queryRaw`SELECT 1`; res.json({ success: true, service: 'smart-outpass-api' }); } catch (error) { next(error); } });
+app.post('/api/auth/login', limiter(100, 'Too many login attempts. Please wait a few minutes.'), async (req, res, next) => { try {
+  const input = parse(loginSchema, req.body, res); if (!input) return;
+  const cleanEmail = input.email.trim().toLowerCase();
+  const user = await prisma.user.findFirst({ where: { email: { equals: cleanEmail, mode: 'insensitive' } } });
+  if (!user || !(await bcrypt.compare(input.password, user.passwordHash))) return res.status(401).json({ success: false, message: 'Invalid email or password.' });
+  await audit('LOGIN', { actorId: user.id }); res.json({ success: true, token: session(user), user: { email: user.email, role: user.role } });
+} catch (error) { next(error); } });
+
+app.post('/api/outpass/request', limiter(12), async (req, res, next) => { try {
+  const input = parse(requestSchema, req.body, res); if (!input) return;
+  const rollNo = roll(input.rollNo);
+  const student = await prisma.student.upsert({ where: { rollNo }, update: { name: input.name }, create: { rollNo, name: input.name } });
+  const active = await prisma.outpass.findFirst({ where: { studentId: student.id, status: { in: [OutpassStatus.PENDING, OutpassStatus.APPROVED] } }, select: { id: true } });
+  if (active) return res.status(409).json({ success: false, message: 'This student already has an active outpass request.' });
+  const leaveAt = new Date();
+  const returnAt = new Date(leaveAt.getTime() + Number(process.env.OUTPASS_VALIDITY_HOURS || 24) * 60 * 60 * 1000);
+  const outpass = await prisma.outpass.create({ data: { studentId: student.id, destination: input.destination, reason: input.reason, leaveAt, returnAt } });
+  await audit('REQUEST_CREATED', { outpassId: outpass.id, metadata: { rollNo } });
+  res.status(201).json({ success: true, message: 'Request submitted to HOD.', data: { id: outpass.id, status: outpass.status } });
+} catch (error) { if (error.code === 'P2002') return res.status(409).json({ success: false, message: 'This student already has an active outpass request.' }); next(error); } });
+
+app.get('/api/outpass/status/:id', async (req, res, next) => { try {
+  const rollNo = roll(req.query.rollNo || ''); if (!rollNo) return res.status(400).json({ success: false, message: 'Roll number is required.' });
+  const outpass = await prisma.outpass.findFirst({ where: { id: req.params.id, student: { rollNo } } });
+  if (!outpass) return res.status(404).json({ success: false, message: 'Request not found.' });
+  const data = { id: outpass.id, status: outpass.status, destination: outpass.destination, leaveAt: outpass.leaveAt, returnAt: outpass.returnAt, rejectNote: outpass.rejectNote };
+  if (outpass.status === OutpassStatus.APPROVED) data.qrToken = jwt.sign({ outpassId: outpass.id, rollNo, type: 'outpass-qr' }, secret, { expiresIn: '24h' });
+  res.json({ success: true, data });
+} catch (error) { next(error); } });
+
+app.get('/api/mentor/outpasses', allowed(Role.MENTOR), async (_req, res, next) => { try {
+  const rows = await prisma.outpass.findMany({ where: { status: OutpassStatus.PENDING, mentorVerified: false }, include: { student: true }, orderBy: { requestedAt: 'asc' } });
+  res.json({ success: true, data: rows });
+} catch (error) { next(error); } });
+
+app.put('/api/mentor/outpasses/:id/verify', allowed(Role.MENTOR), async (req, res, next) => { try {
+  const result = await prisma.outpass.updateMany({ where: { id: req.params.id, status: OutpassStatus.PENDING, mentorVerified: false }, data: { mentorVerified: true, mentorId: req.user.sub } });
+  if (!result.count) return res.status(409).json({ success: false, message: 'Only an unverified pending request can be verified.' });
+  await audit('OUTPASS_MENTOR_VERIFIED', { outpassId: req.params.id, actorId: req.user.sub });
+  res.json({ success: true, message: 'Request verified and sent to HOD.' });
+} catch (error) { next(error); } });
+
+app.get('/api/hod/outpasses', allowed(Role.HOD), async (req, res, next) => { try {
+  const page = Math.max(1, Number(req.query.page) || 1); const pageSize = Math.min(100, Math.max(10, Number(req.query.pageSize) || 20));
+  const { selected, start, end } = range(req.query.month); const search = req.query.search?.trim(); const status = Object.values(OutpassStatus).includes(req.query.status) ? req.query.status : undefined;
+  const where = { requestedAt: { gte: start, lt: end }, mentorVerified: true, status, ...(search ? { OR: [{ student: { rollNo: { contains: search.toUpperCase(), mode: 'insensitive' } } }, { student: { name: { contains: search, mode: 'insensitive' } } }] } : {}) };
+  const takenThisMonth = { requestedAt: { gte: start, lt: end }, status: { in: [OutpassStatus.APPROVED, OutpassStatus.EXITED] } };
+  const [total, rows, grouped] = await prisma.$transaction([prisma.outpass.count({ where }), prisma.outpass.findMany({ where, include: { student: true }, orderBy: { requestedAt: 'desc' }, skip: (page - 1) * pageSize, take: pageSize }), prisma.outpass.groupBy({ by: ['studentId'], where: takenThisMonth, _count: { _all: true } })]);
+  const counts = new Map(grouped.map((item) => [item.studentId, item._count._all]));
+  res.json({ success: true, data: rows.map((item) => ({ ...item, monthlyRequestCount: counts.get(item.studentId) || 0 })), meta: { page, pageSize, total, month: selected } });
+} catch (error) { next(error); } });
+
+app.get('/api/hod/students/:rollNo/history', allowed(Role.HOD), async (req, res, next) => { try {
+  const rollNo = roll(req.params.rollNo); const { selected, start, end } = range(req.query.month); const student = await prisma.student.findUnique({ where: { rollNo } });
+  if (!student) return res.status(404).json({ success: false, message: 'Student not found.' });
+  const [monthlyCount, history] = await prisma.$transaction([prisma.outpass.count({ where: { studentId: student.id, requestedAt: { gte: start, lt: end }, status: { in: [OutpassStatus.APPROVED, OutpassStatus.EXITED] } } }), prisma.outpass.findMany({ where: { studentId: student.id }, orderBy: { requestedAt: 'desc' }, take: 12 })]);
+  res.json({ success: true, data: { student, month: selected, monthlyCount, policyWarning: monthlyCount >= Number(process.env.MONTHLY_REQUEST_LIMIT || 4), history } });
+} catch (error) { next(error); } });
+
+app.put('/api/hod/outpasses/:id/approve', allowed(Role.HOD), async (req, res, next) => { try {
+  const result = await prisma.outpass.updateMany({ where: { id: req.params.id, status: OutpassStatus.PENDING }, data: { status: OutpassStatus.APPROVED, approvedAt: new Date(), approvedById: req.user.sub } });
+  if (!result.count) return res.status(409).json({ success: false, message: 'Only a pending request can be approved.' }); await audit('OUTPASS_APPROVED', { outpassId: req.params.id, actorId: req.user.sub }); res.json({ success: true, message: 'Outpass approved.' });
+} catch (error) { next(error); } });
+app.put('/api/hod/outpasses/:id/reject', allowed(Role.HOD), async (req, res, next) => { try {
+  const input = parse(rejectSchema, req.body, res); if (!input) return;
+  const result = await prisma.outpass.updateMany({ where: { id: req.params.id, status: OutpassStatus.PENDING }, data: { status: OutpassStatus.REJECTED, rejectedAt: new Date(), rejectNote: input.note, approvedById: req.user.sub } });
+  if (!result.count) return res.status(409).json({ success: false, message: 'Only a pending request can be rejected.' }); await audit('OUTPASS_REJECTED', { outpassId: req.params.id, actorId: req.user.sub, metadata: { note: input.note } }); res.json({ success: true, message: 'Outpass rejected.' });
+} catch (error) { next(error); } });
+
+app.post('/api/guard/verify', allowed(Role.GUARD), async (req, res, next) => { try {
+  const value = z.string().min(20).safeParse(req.body?.token); if (!value.success) return res.status(400).json({ success: false, message: 'A valid QR token is required.' });
+  let payload; try { payload = jwt.verify(value.data, secret); } catch { return res.status(403).json({ success: false, message: 'QR code is invalid or expired.' }); }
+  if (payload.type !== 'outpass-qr') return res.status(403).json({ success: false, message: 'QR code is invalid.' });
+  const result = await prisma.outpass.updateMany({ where: { id: payload.outpassId, status: OutpassStatus.APPROVED, returnAt: { gt: new Date() } }, data: { status: OutpassStatus.EXITED, exitedAt: new Date() } });
+  if (!result.count) return res.status(409).json({ success: false, message: 'This pass is no longer valid, was already used, or has expired.' });
+  const outpass = await prisma.outpass.findUnique({ where: { id: payload.outpassId }, include: { student: true } }); await audit('OUTPASS_EXITED', { outpassId: payload.outpassId, actorId: req.user.sub });
+  res.json({ success: true, message: 'Valid outpass. Student may exit.', data: { name: outpass.student.name, rollNo: outpass.student.rollNo, destination: outpass.destination, returnAt: outpass.returnAt } });
+} catch (error) { next(error); } });
+
+app.use((error, _req, res, _next) => { console.error(error); res.status(error.message === 'Origin is not allowed by CORS' ? 403 : 500).json({ success: false, message: error.message === 'Origin is not allowed by CORS' ? error.message : 'Server error. Please try again.' }); });
+bootstrapUsers().then(() => app.listen(PORT, '0.0.0.0', () => console.log(`Smart Outpass API listening on port ${PORT}`))).catch((error) => { console.error('Startup failed:', error); process.exit(1); });
